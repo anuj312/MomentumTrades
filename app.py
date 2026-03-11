@@ -5,16 +5,15 @@
 # Local run:
 #   export KITE_API_KEY="..."
 #   export KITE_ACCESS_TOKEN="..."
-#   python app.py
+#   uvicorn app:app --host 0.0.0.0 --port 5555 --workers 1
 #
-# Render start command (recommended):
+# Render start command:
 #   uvicorn app:app --host 0.0.0.0 --port $PORT --workers 1
 #
 # Notes:
 # - Put theme.css in the SAME folder as this app.py
-# - Clicking a STOCK name opens TradingView (NSE) in a new tab at 5-min timeframe.
-# - Clicking a SECTOR pill opens a popup listing all stocks in that sector
-#   with columns: STOCK | RFACTOR | RVOLM (ALL CAPS)
+# - Clicking a STOCK name opens TradingView (NSE) at 5-min timeframe.
+# - Clicking a SECTOR bar opens a popup listing sector stocks.
 
 import os
 import sys
@@ -440,7 +439,6 @@ def compute_rfv2(token: int) -> Optional[dict]:
     vol = DAY_VOL.get(token)
     ohlc = LAST_OHLC.get(token) or {}
 
-    # fallback if live tick data missing
     if ltp is None or vol is None:
         eod = EOD_SNAPSHOT.get(token)
         if not eod:
@@ -449,7 +447,6 @@ def compute_rfv2(token: int) -> Optional[dict]:
         vol = float(eod["volume"])
         ohlc = {"open": eod["open"], "high": eod["high"], "low": eod["low"], "close": eod["prev_close"]}
 
-    # robust OHLC fill from snapshot
     eod = EOD_SNAPSHOT.get(token)
     if eod:
         ohlc.setdefault("open", eod["open"])
@@ -563,7 +560,6 @@ def _init_kite_and_instruments():
             token_to_symbol = t2s
             ACTIVE_SYMBOLS = active
             TOKENS = toks
-
             SEED_PROGRESS["total"] = len(TOKENS)
 
         INIT_DONE = True
@@ -580,13 +576,9 @@ def _init_kite_and_instruments():
 def _seed_daily():
     global SEED_DONE, SEED_STARTED, SEED_CURRENT_SYMBOL, SEED_START_TIME
 
-    # wait for init
     while not INIT_DONE and not INIT_ERROR:
         time.sleep(0.25)
-
-    if INIT_ERROR:
-        return
-    if kite is None:
+    if INIT_ERROR or kite is None:
         return
 
     SEED_STARTED = True
@@ -627,7 +619,6 @@ def _seed_daily():
         df["d"] = df["date"].dt.date
         today = now_ist.date()
 
-        # if market open, last daily candle may be partial (today)
         if market_open(now_ist) and df.iloc[-1]["d"] == today:
             df = df.iloc[:-1].copy()
 
@@ -688,7 +679,6 @@ def _start_ticker():
     def _run():
         global WS_CONNECTED
 
-        # wait for init
         while not INIT_DONE and not INIT_ERROR:
             time.sleep(0.25)
         if INIT_ERROR:
@@ -816,18 +806,6 @@ def api_all(sort: str = "rfactor", order: str = "desc", limit: int = 999):
     return results[:limit]
 
 
-@app.get("/api/rfactor/{symbol}")
-def api_symbol(symbol: str):
-    with LOCK:
-        tok = symbol_to_token.get(symbol.upper())
-        if not tok:
-            return JSONResponse({"error": "not found"}, 404)
-        r = compute_rfv2(tok)
-    if not r:
-        return JSONResponse({"error": "insufficient data"}, 404)
-    return r
-
-
 @app.get("/api/sectors")
 def api_sectors():
     with LOCK:
@@ -836,14 +814,14 @@ def api_sectors():
     sectors: Dict[str, List[dict]] = {}
     for r in all_r:
         sec = r["sector"]
-        if sec in ("NIFTY_50", "OTHER"):
+        if sec in ("OTHER",):
             continue
         sectors.setdefault(sec, []).append(r)
 
     result = {}
     for sec, stocks in sectors.items():
         gainers = [s for s in stocks if s["pct_open"] > 0]
-        losers = [s for s in stocks if s["pct_open"] < 0]
+        losers  = [s for s in stocks if s["pct_open"] < 0]
         result[sec] = {
             "avg_dirr": round(float(np.mean([s["dirr"] for s in stocks])), 4),
             "avg_rfactor": round(float(np.mean([s["rfactor"] for s in stocks])), 4),
@@ -851,10 +829,24 @@ def api_sectors():
             "n": len(stocks),
             "gainers": len(gainers),
             "losers": len(losers),
-            "sector_return": round(float(np.mean([s["pct_open"] for s in stocks])), 4),
         }
 
-    return dict(sorted(result.items(), key=lambda kv: kv[1]["avg_dirr"], reverse=True))
+    # ----- ADD NIFTY 50 AGGREGATE ROW -----
+    nifty_syms = set(SECTOR_DEFINITIONS.get("NIFTY_50", []))
+    nifty = [r for r in all_r if r["symbol"] in nifty_syms]
+    if nifty:
+        gainers = [s for s in nifty if s["pct_open"] > 0]
+        losers  = [s for s in nifty if s["pct_open"] < 0]
+        result["NIFTY 50"] = {
+            "avg_dirr": round(float(np.mean([s["dirr"] for s in nifty])), 4),
+            "avg_rfactor": round(float(np.mean([s["rfactor"] for s in nifty])), 4),
+            "avg_rvolm": round(float(np.mean([s["rvolm"] for s in nifty])), 4),
+            "n": len(nifty),
+            "gainers": len(gainers),
+            "losers": len(losers),
+        }
+
+    return result
 
 
 @app.websocket("/ws")
@@ -870,7 +862,7 @@ async def ws_endpoint(ws: WebSocket):
 
 
 # =============================================================================
-# HTML (NOT an f-string; avoids JS { } issues)
+# HTML
 # =============================================================================
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="en">
@@ -878,7 +870,7 @@ HTML_PAGE = """<!DOCTYPE html>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>RFactor v2 — Live</title>
-  <link rel="stylesheet" href="/theme.css?v=1">
+  <link rel="stylesheet" href="/theme.css?v=3">
 </head>
 <body>
 
@@ -915,8 +907,18 @@ HTML_PAGE = """<!DOCTYPE html>
   <div class="main">
     <div class="sumrow" id="sum"></div>
 
-    <div class="sec-title">SECTOR RANKINGS (BY DIRR)</div>
-    <div class="sec-wrap" id="secs"></div>
+    <div class="sec-title">SECTOR RANKINGS (DIRR)</div>
+    <div class="sec-chart">
+  <div class="sec-y" id="sec-y"></div>
+
+  <div class="sec-plot-wrap">
+    <div class="sec-plot" id="sec-plot"></div>
+    <div class="sec-tip" id="sec-tip"></div>
+  </div>
+
+  <div class="sec-y-pad"></div>
+  <div class="sec-xlabels" id="sec-xlabels"></div>
+</div>
 
     <div class="tbl-row">
       <div class="tcard">
@@ -957,8 +959,6 @@ HTML_PAGE = """<!DOCTYPE html>
     </div>
   </div>
 
-  <div class="footer">RFactor v2 Live · Port __PORT__</div>
-
 <script>
 const R = 2000;
 let seedWasRunning = false;
@@ -972,7 +972,7 @@ function fT(v){
 }
 function pp(v){
   const c = v>0 ? 'pos' : (v<0 ? 'neg' : 'neu');
-  return '<span class="pill '+c+'">'+(v>0?'+':'')+f(v)+'%</span>';
+  return '<span class="pill '+c+'">'+(v>0?'+':'')+f(v,2)+'%</span>';
 }
 function sb(s){ return '<span class="bdg '+(s||'weak').toLowerCase()+'">'+(s||'—')+'</span>'; }
 
@@ -1009,7 +1009,7 @@ function row(r, i){
       '</a>'+
       '<div class="sec-sm">'+sec+'</div>'+
     '</td>'+
-    '<td class="num">₹'+f(r.ltp)+'</td>'+
+    '<td class="num">₹'+f(r.ltp,2)+'</td>'+
     '<td class="num">'+pp(r.pct_open)+'</td>'+
     '<td class="num rf">'+f(r.rfactor, 2)+'</td>'+
     '<td class="num">'+f(r.rvolm, 2)+'x</td>'+
@@ -1041,7 +1041,7 @@ function openSectorModal(sector){
     return;
   }
 
-   let h = ''
+  let h = ''
     + '<table class="mtbl">'
     + '<thead><tr>'
     + '<th>STOCK</th>'
@@ -1071,31 +1071,145 @@ function closeSectorModal(){
 }
 
 document.addEventListener('DOMContentLoaded', () => {
-  const secs = document.getElementById('secs');
   const bg = document.getElementById('sec-modal-bg');
   const closeBtn = document.getElementById('sec-modal-close');
 
-  if(secs){
-    secs.addEventListener('click', (e) => {
-      const pill = e.target.closest('.sec-pill[data-sector]');
-      if(!pill) return;
-      const sector = decodeURIComponent(pill.dataset.sector || '');
-      if(sector) openSectorModal(sector);
-    });
-  }
-
   if(closeBtn) closeBtn.addEventListener('click', closeSectorModal);
-
   if(bg){
     bg.addEventListener('click', (e) => {
       if(e.target && e.target.id === 'sec-modal-bg') closeSectorModal();
     });
   }
-
   document.addEventListener('keydown', (e) => {
     if(e.key === 'Escape') closeSectorModal();
   });
 });
+
+/* ---------- SECTOR CHART ---------- */
+function niceStep(range, ticks){
+  const rough = range / Math.max(1, ticks);
+  if(rough <= 0) return 1;
+  const pow = Math.pow(10, Math.floor(Math.log10(rough)));
+  const r = rough / pow;
+  let step = 10;
+  if(r <= 1) step = 1;
+  else if(r <= 2) step = 2;
+  else if(r <= 5) step = 5;
+  return step * pow;
+}
+
+function renderSectorChart(secObj){
+  const yEl = document.getElementById('sec-y');
+  const plot = document.getElementById('sec-plot');
+  const tip = document.getElementById('sec-tip');
+  const xlabels = document.getElementById('sec-xlabels');
+  if(!yEl || !plot || !tip) return;
+
+  const entries = Object.entries(secObj || {}).sort((a,b) => (b[1].avg_dirr||0) - (a[1].avg_dirr||0));
+  if(!entries.length){
+    yEl.innerHTML = '';
+    plot.innerHTML = '<div class="muted">Waiting for sector data…</div>';
+    return;
+  }
+
+  const values = entries.map(([_,d]) => Number(d.avg_dirr||0));
+  let minV = Math.min(...values, 0);
+  let maxV = Math.max(...values, 0);
+
+  // Expand a bit if flat
+  if(Math.abs(maxV - minV) < 1e-6){
+    maxV += 1;
+    minV -= 1;
+  }
+
+  const height = 320;                 // must match CSS height
+  plot.style.height = height + 'px';
+
+  const step = niceStep(maxV - minV, 7);
+  const minT = Math.floor(minV / step) * step;
+  const maxT = Math.ceil(maxV / step) * step;
+
+  const y = (v) => ((maxT - v) / (maxT - minT)) * height; // 0..height px
+  const yZero = y(0);
+
+  // Y axis ticks
+  let yHtml = '';
+  for(let v = maxT; v >= minT - 1e-9; v -= step){
+    const yp = y(v);
+    const label = (Math.abs(step) >= 1) ? f(v,0) : f(v,2);
+    yHtml += '<div class="sec-tick" style="top:'+yp+'px">'+label+'</div>';
+  }
+  yEl.innerHTML = yHtml;
+
+  // Plot baseline
+  let html = '<div class="sec-zero" style="top:'+yZero+'px"></div>';
+
+  // Bars
+  for(const [name, d] of entries){
+    const v = Number(d.avg_dirr||0);
+    const top = Math.min(y(v), yZero);
+    const bot = Math.max(y(v), yZero);
+    const h = Math.max(2, bot - top); // keep visible
+
+    const cls = v >= 0 ? 'pos' : 'neg';
+    const valTxt = (v>=0?'+':'') + f(v,2);
+
+    html += ''
+      + '<div class="sec-col" data-sector="'+encodeURIComponent(name)+'" data-val="'+valTxt+'" data-name="'+escapeHtml(name)+'">'
+      +   '<div class="sec-col-box">'
+      +     '<div class="sec-bar '+cls+'" style="top:'+top+'px;height:'+h+'px"></div>'
+      +   '</div>'
+      + '</div>';
+  }
+
+  plot.innerHTML = html;
+  
+  if(xlabels){
+  xlabels.innerHTML = entries.map(([name, d]) => {
+    return '<div class="sec-xlab" data-sector="'+encodeURIComponent(name)+'">'
+      + escapeHtml(name) +
+    '</div>';
+  }).join('');
+
+  // make labels clickable too
+  xlabels.querySelectorAll('.sec-xlab').forEach(lb => {
+    lb.addEventListener('click', () => {
+      const sector = decodeURIComponent(lb.dataset.sector || '');
+      if(sector) openSectorModal(sector);
+    });
+  });
+}
+
+  // Events (hover tooltip + click)
+  const cols = plot.querySelectorAll('.sec-col');
+  cols.forEach(col => {
+    col.addEventListener('mouseenter', (e) => {
+      const name = col.dataset.name || '';
+      const val = col.dataset.val || '';
+      tip.innerHTML = '<div class="sec-tip-t">'+name+'</div><div class="sec-tip-v">'+val+'</div>';
+      tip.style.display = 'block';
+      col.classList.add('active');
+    });
+
+    col.addEventListener('mousemove', (e) => {
+      const rect = plot.getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      const y = e.clientY - rect.top;
+      tip.style.left = (x + 14) + 'px';
+      tip.style.top = (y - 10) + 'px';
+    });
+
+    col.addEventListener('mouseleave', () => {
+      tip.style.display = 'none';
+      col.classList.remove('active');
+    });
+
+    col.addEventListener('click', () => {
+      const sector = decodeURIComponent(col.dataset.sector || '');
+      if(sector) openSectorModal(sector);
+    });
+  });
+}
 
 async function tick(){
   try{
@@ -1109,7 +1223,7 @@ async function tick(){
     const sec = await sR.json();
     allData = all;
 
-    // STATUS TAG
+    // Status tag
     const st = document.getElementById('status-tag');
     if(h.init_error){
       st.textContent = 'ERROR'; st.className = 'tag off';
@@ -1123,7 +1237,7 @@ async function tick(){
       st.textContent = 'OFFLINE'; st.className = 'tag off';
     }
 
-    // HEADER STATS
+    // Header stats
     let hs = '';
     hs += '<div class="chip"><span class="lbl">TICKS</span><span class="val c">'+fT(h.total_ticks)+'</span></div>';
     hs += '<div class="chip"><span class="lbl">TPS</span><span class="val c">'+f(h.tps,1)+'</span></div>';
@@ -1133,7 +1247,7 @@ async function tick(){
     hs += '<div class="chip"><span class="val">'+h.time_ist+' IST</span></div>';
     document.getElementById('hdr-stats').innerHTML = hs;
 
-    // SEED BAR
+    // Seed bar
     const seedBar = document.getElementById('seed-bar-wrap');
     const seedDone = document.getElementById('seed-done');
     const seedFill = document.getElementById('seed-fill');
@@ -1165,7 +1279,7 @@ async function tick(){
       }
     }
 
-    // SUMMARY
+    // Summary
     const g = all.filter(r => r.pct_open > 0);
     const l = all.filter(r => r.pct_open < 0);
     const avgR = all.length ? (all.reduce((s,r)=>s+r.rfactor,0)/all.length) : 0;
@@ -1179,28 +1293,10 @@ async function tick(){
     sm += sc('AVG RVOLM', all.length ? (f(avgRv,2)+'x') : '—', '');
     document.getElementById('sum').innerHTML = sm;
 
-    // SECTORS
-    const entries = Object.entries(sec);
-    if(entries.length){
-      const mx = Math.max(...entries.map(([_,v]) => Math.abs(v.avg_dirr)), 0.01);
-      let sh = '';
-      for(const [name, d] of entries){
-        const p = d.avg_dirr >= 0;
-        const bp = Math.min(100, (Math.abs(d.avg_dirr)/mx)*100);
-        const bc = p ? 'var(--green)' : 'var(--red)';
-        sh += '<div class="sec-pill sec-click" data-sector="'+encodeURIComponent(name)+'">'+
-          '<span class="sn">'+escapeHtml(name)+'</span>'+
-          '<span class="sd '+(p?'p':'n')+'">'+(p?'+':'')+f(d.avg_dirr,3)+'</span>'+
-          '<div class="sb"><div class="sf" style="width:'+bp+'%;background:'+bc+'"></div></div>'+
-          '<span class="sc">'+d.gainers+'↑ '+d.losers+'↓</span>'+
-        '</div>';
-      }
-      document.getElementById('secs').innerHTML = sh;
-    }else{
-      document.getElementById('secs').innerHTML = '<div class="muted">Waiting for sector data…</div>';
-    }
+    // Sector chart
+    renderSectorChart(sec);
 
-    // TABLES
+    // Tables
     if(h.init_error){
       document.getElementById('gtb').innerHTML = waitRow('Init error', escapeHtml(h.init_error));
       document.getElementById('ltb').innerHTML = waitRow('Init error', escapeHtml(h.init_error));
@@ -1233,8 +1329,6 @@ async function tick(){
 
   }catch(e){
     console.error(e);
-    document.getElementById('gtb').innerHTML = waitRow('Dashboard error', String(e));
-    document.getElementById('ltb').innerHTML = waitRow('Dashboard error', String(e));
   }
 }
 
@@ -1251,26 +1345,6 @@ def dashboard():
     return HTML_PAGE.replace("__PORT__", str(PORT))
 
 
-# =============================================================================
-# MAIN (local)
-# =============================================================================
 if __name__ == "__main__":
     import uvicorn
-
-    if not API_KEY or not ACCESS_TOKEN:
-        log.error("Set KITE_API_KEY and KITE_ACCESS_TOKEN before running.")
-        sys.exit(1)
-
-    print(f"\n  ╔══════════════════════════════════════════╗")
-    print(f"  ║  RFACTOR v2 — LIVE DASHBOARD             ║")
-    print(f"  ║  http://localhost:{PORT:<24} ║")
-    print(f"  ╚══════════════════════════════════════════╝\n")
-
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=PORT,
-        workers=1,
-        reload=False,
-        log_level="info",
-    )
+    uvicorn.run(app, host="0.0.0.0", port=PORT, workers=1, reload=False, log_level="info")
