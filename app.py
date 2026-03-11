@@ -1,19 +1,20 @@
-
 # app.py
 #
 # RFactor v2 — Live Dashboard (FastAPI + KiteTicker)
 #
-# Run:
+# Local run:
 #   export KITE_API_KEY="..."
 #   export KITE_ACCESS_TOKEN="..."
 #   python app.py
 #
-# Open:
-#   http://localhost:5555
+# Render start command (recommended):
+#   uvicorn app:app --host 0.0.0.0 --port $PORT --workers 1
 #
 # Notes:
-# - Place theme.css in the SAME directory as this app.py
+# - Put theme.css in the SAME folder as this app.py
 # - Clicking a STOCK name opens TradingView (NSE) in a new tab at 5-min timeframe.
+# - Clicking a SECTOR pill opens a popup listing all stocks in that sector
+#   with columns: STOCK | RFACTOR | RVOLM (ALL CAPS)
 
 import os
 import sys
@@ -50,9 +51,6 @@ PORT = int(os.getenv("PORT", os.getenv("RFV2_PORT", "5555")))
 
 API_KEY = os.getenv("KITE_API_KEY", "").strip()
 ACCESS_TOKEN = os.getenv("KITE_ACCESS_TOKEN", "").strip()
-if not API_KEY or not ACCESS_TOKEN:
-    log.error("Set environment variables: KITE_API_KEY and KITE_ACCESS_TOKEN")
-    sys.exit(1)
 
 LOOKBACK_SESSIONS = int(os.getenv("RFV2_LOOKBACK_DAYS", "20"))
 HISTORY_DAYS = int(os.getenv("RFV2_HISTORY_DAYS", "220"))
@@ -102,12 +100,12 @@ SECTOR_DEFINITIONS = {
         "BAJAJ-AUTO", "ASHOKLEY",
         "MARUTI", "TVSMOTOR",
         "MOTHERSON", "SONACOMS",
-        "UNOMINDA", "TATAMOTORS",
+        "UNOMINDA", "TMPV",
         "AMBER",
     ],
     "IT": [
         "INFY", "TCS", "HCLTECH", "WIPRO",
-        "TECHM", "LTIM", "MPHASIS",
+        "TECHM", "LTM", "MPHASIS",
         "KPITTECH", "COFORGE", "PERSISTENT",
         "TATAELXSI", "OFSS", "CAMS",
         "TATATECH", "NAUKRI", "KAYNES",
@@ -189,9 +187,10 @@ SECTOR_DEFINITIONS = {
         "MAXHEALTH", "NESTLEIND", "NTPC", "ONGC", "POWERGRID", "RELIANCE",
         "SBILIFE", "SHRIRAMFIN", "SBIN", "SUNPHARMA", "TCS", "TATACONSUM",
         "TATASTEEL", "TECHM", "TITAN", "TRENT", "ULTRACEMCO", "WIPRO",
-        "TATAMOTORS", "ETERNAL",
+        "TMPV", "ETERNAL",
     ],
 }
+
 ALL_SYMBOLS = sorted(set(sum(SECTOR_DEFINITIONS.values(), [])))
 
 
@@ -203,35 +202,16 @@ def _sector_of(sym: str) -> str:
 
 
 # =============================================================================
-# KITE INIT + INSTRUMENT RESOLUTION
-# =============================================================================
-log.info("Connecting to Kite…")
-kite = KiteConnect(api_key=API_KEY)
-kite.set_access_token(ACCESS_TOKEN)
-
-log.info("Loading NSE instruments…")
-try:
-    ins_df = pd.DataFrame(kite.instruments("NSE"))
-except Exception as e:
-    log.exception("Failed to load instruments: %s", e)
-    sys.exit(1)
-
-ins_df = ins_df[ins_df["tradingsymbol"].isin(ALL_SYMBOLS)].copy()
-symbol_to_token: Dict[str, int] = dict(zip(ins_df["tradingsymbol"], ins_df["instrument_token"]))
-token_to_symbol: Dict[int, str] = {v: k for k, v in symbol_to_token.items()}
-
-ACTIVE_SYMBOLS = sorted(symbol_to_token.keys())
-TOKENS = sorted(symbol_to_token.values())
-
-missing = set(ALL_SYMBOLS) - set(ACTIVE_SYMBOLS)
-if missing:
-    log.warning("Missing symbols (not found in NSE instruments): %s", sorted(missing))
-log.info("Resolved %d / %d symbols", len(ACTIVE_SYMBOLS), len(ALL_SYMBOLS))
-
-# =============================================================================
 # SHARED STATE
 # =============================================================================
 LOCK = threading.Lock()
+
+kite: Optional[KiteConnect] = None
+
+symbol_to_token: Dict[str, int] = {}
+token_to_symbol: Dict[int, str] = {}
+ACTIVE_SYMBOLS: List[str] = []
+TOKENS: List[int] = []
 
 LAST_PRICE: Dict[int, float] = {}
 DAY_VOL: Dict[int, float] = {}
@@ -247,12 +227,15 @@ TPS_WINDOW = 2.0
 
 SEED_DONE = False
 SEED_STARTED = False
-SEED_PROGRESS = {"done": 0, "total": len(TOKENS), "errors": 0}
+SEED_PROGRESS = {"done": 0, "total": 0, "errors": 0}
 SEED_CURRENT_SYMBOL = ""
 SEED_START_TIME: Optional[float] = None
 
 WS_CONNECTED = False
 WS_CLIENTS: List[WebSocket] = []
+
+INIT_DONE = False
+INIT_ERROR: Optional[str] = None
 
 # =============================================================================
 # MARKET / EXPECTED VOLUME
@@ -326,7 +309,6 @@ def _hot_push(token: int, epoch: float, ltp: float, vol: Optional[float]):
         dq = deque()
         HOT_HISTORY[token] = dq
 
-    # compress to ~1 sample per HOT_SAMPLE_SEC
     if dq and (epoch - dq[-1][0]) < HOT_SAMPLE_SEC:
         e, _, lv = dq[-1]
         dq[-1] = (e, ltp, vol if vol is not None else lv)
@@ -467,7 +449,7 @@ def compute_rfv2(token: int) -> Optional[dict]:
         vol = float(eod["volume"])
         ohlc = {"open": eod["open"], "high": eod["high"], "low": eod["low"], "close": eod["prev_close"]}
 
-    # robust OHLC fill from snapshot (covers early-morning missing tick OHLC)
+    # robust OHLC fill from snapshot
     eod = EOD_SNAPSHOT.get(token)
     if eod:
         ohlc.setdefault("open", eod["open"])
@@ -546,10 +528,67 @@ def compute_all() -> List[dict]:
 
 
 # =============================================================================
+# INIT (KITE + INSTRUMENTS)
+# =============================================================================
+def _init_kite_and_instruments():
+    global kite, symbol_to_token, token_to_symbol, ACTIVE_SYMBOLS, TOKENS, INIT_DONE, INIT_ERROR
+
+    if not API_KEY or not ACCESS_TOKEN:
+        INIT_ERROR = "Missing KITE_API_KEY / KITE_ACCESS_TOKEN"
+        log.error(INIT_ERROR)
+        return
+
+    try:
+        log.info("Connecting to Kite…")
+        k = KiteConnect(api_key=API_KEY)
+        k.set_access_token(ACCESS_TOKEN)
+
+        log.info("Loading NSE instruments…")
+        ins_df = pd.DataFrame(k.instruments("NSE"))
+        ins_df = ins_df[ins_df["tradingsymbol"].isin(ALL_SYMBOLS)].copy()
+
+        s2t: Dict[str, int] = dict(zip(ins_df["tradingsymbol"], ins_df["instrument_token"]))
+        t2s: Dict[int, str] = {v: k for k, v in s2t.items()}
+
+        active = sorted(s2t.keys())
+        toks = sorted(s2t.values())
+
+        missing = set(ALL_SYMBOLS) - set(active)
+        if missing:
+            log.warning("Missing symbols (not in NSE instruments): %s", sorted(missing))
+
+        with LOCK:
+            kite = k
+            symbol_to_token = s2t
+            token_to_symbol = t2s
+            ACTIVE_SYMBOLS = active
+            TOKENS = toks
+
+            SEED_PROGRESS["total"] = len(TOKENS)
+
+        INIT_DONE = True
+        log.info("Resolved %d / %d symbols", len(ACTIVE_SYMBOLS), len(ALL_SYMBOLS))
+
+    except Exception as e:
+        INIT_ERROR = str(e)
+        log.exception("Init failed: %s", e)
+
+
+# =============================================================================
 # DAILY SEED
 # =============================================================================
 def _seed_daily():
     global SEED_DONE, SEED_STARTED, SEED_CURRENT_SYMBOL, SEED_START_TIME
+
+    # wait for init
+    while not INIT_DONE and not INIT_ERROR:
+        time.sleep(0.25)
+
+    if INIT_ERROR:
+        return
+    if kite is None:
+        return
+
     SEED_STARTED = True
     SEED_START_TIME = time.time()
     log.info("Seeding %d-day baselines for %d tokens…", LOOKBACK_SESSIONS, len(TOKENS))
@@ -648,6 +687,13 @@ def _start_ticker():
 
     def _run():
         global WS_CONNECTED
+
+        # wait for init
+        while not INIT_DONE and not INIT_ERROR:
+            time.sleep(0.25)
+        if INIT_ERROR:
+            return
+
         while True:
             try:
                 kws = KiteTicker(API_KEY, ACCESS_TOKEN)
@@ -713,9 +759,10 @@ app = FastAPI(title="RFactor v2 Live")
 
 @app.on_event("startup")
 async def startup():
+    threading.Thread(target=_init_kite_and_instruments, daemon=True).start()
     threading.Thread(target=_seed_daily, daemon=True).start()
     _start_ticker()
-    log.info("Dashboard running on http://localhost:%d", PORT)
+    log.info("Dashboard starting on port %d", PORT)
 
 
 @app.get("/theme.css")
@@ -726,6 +773,9 @@ def theme_css():
     return FileResponse(path, media_type="text/css")
 
 
+# =============================================================================
+# API
+# =============================================================================
 @app.get("/api/health")
 def health():
     with LOCK:
@@ -733,6 +783,8 @@ def health():
         elapsed = (time.time() - SEED_START_TIME) if SEED_START_TIME else 0.0
         return {
             "status": "ok",
+            "init_done": INIT_DONE,
+            "init_error": INIT_ERROR,
             "seed_done": SEED_DONE,
             "seed_started": SEED_STARTED,
             "seed_progress": dict(SEED_PROGRESS),
@@ -761,16 +813,15 @@ def api_all(sort: str = "rfactor", order: str = "desc", limit: int = 999):
         results.sort(key=lambda x: x.get(sort, 0), reverse=rev)
     else:
         results.sort(key=lambda x: abs(x.get(sort, 0)), reverse=rev)
-
     return results[:limit]
 
 
 @app.get("/api/rfactor/{symbol}")
 def api_symbol(symbol: str):
-    tok = symbol_to_token.get(symbol.upper())
-    if not tok:
-        return JSONResponse({"error": "not found"}, 404)
     with LOCK:
+        tok = symbol_to_token.get(symbol.upper())
+        if not tok:
+            return JSONResponse({"error": "not found"}, 404)
         r = compute_rfv2(tok)
     if not r:
         return JSONResponse({"error": "insufficient data"}, 404)
@@ -830,6 +881,18 @@ HTML_PAGE = """<!DOCTYPE html>
   <link rel="stylesheet" href="/theme.css?v=1">
 </head>
 <body>
+
+  <!-- SECTOR MODAL -->
+  <div class="modal-bg" id="sec-modal-bg">
+    <div class="modal" role="dialog" aria-modal="true">
+      <div class="modal-h">
+        <div class="modal-t" id="sec-modal-title">SECTOR</div>
+        <button class="modal-x" id="sec-modal-close" type="button">×</button>
+      </div>
+      <div class="modal-b" id="sec-modal-body"></div>
+    </div>
+  </div>
+
   <div class="hdr">
     <div class="hdr-top">
       <div class="brand">
@@ -899,6 +962,7 @@ HTML_PAGE = """<!DOCTYPE html>
 <script>
 const R = 2000;
 let seedWasRunning = false;
+let allData = [];
 
 function f(v, d=2){ return (v==null ? '—' : Number(v).toFixed(d)); }
 function fT(v){
@@ -918,7 +982,6 @@ function waitRow(msg, sub){
 }
 
 function tvUrl(sym){
-  // TradingView chart: NSE symbol, 5-min interval
   return 'https://www.tradingview.com/chart/?symbol='
     + encodeURIComponent('NSE:' + sym)
     + '&interval=5';
@@ -959,6 +1022,81 @@ function sc(l, v, cls){
   return '<div class="scard"><div class="sl">'+l+'</div><div class="sv '+cls+'">'+v+'</div></div>';
 }
 
+/* ---------- SECTOR MODAL ---------- */
+function openSectorModal(sector){
+  const bg = document.getElementById('sec-modal-bg');
+  const title = document.getElementById('sec-modal-title');
+  const body = document.getElementById('sec-modal-body');
+  if(!bg || !title || !body) return;
+
+  title.textContent = (sector || '').toUpperCase() + ' — STOCKS';
+
+  const rows = (allData || [])
+    .filter(r => r.sector === sector)
+    .sort((a,b) => b.rfactor - a.rfactor);
+
+  if(!rows.length){
+    body.innerHTML = '<div class="muted">NO STOCKS FOUND</div>';
+    bg.classList.add('show');
+    return;
+  }
+
+   let h = ''
+    + '<table class="mtbl">'
+    + '<thead><tr>'
+    + '<th>STOCK</th>'
+    + '<th>RFACTOR</th>'
+    + '<th>RVOLM</th>'
+    + '<th>SIGNAL</th>'
+    + '</tr></thead><tbody>';
+
+  for(const r of rows){
+    const url = tvUrl(r.symbol);
+    h += '<tr>'
+      + '<td><a class="symlink" href="'+url+'" target="_blank" rel="noopener noreferrer">'+escapeHtml(r.symbol)+'</a></td>'
+      + '<td class="rf">' + f(r.rfactor, 4) + '</td>'
+      + '<td>' + f(r.rvolm, 2) + 'X</td>'
+      + '<td class="sig">' + sb(r.signal) + '</td>'
+      + '</tr>';
+  }
+
+  h += '</tbody></table>';
+  body.innerHTML = h;
+  bg.classList.add('show');
+}
+
+function closeSectorModal(){
+  const bg = document.getElementById('sec-modal-bg');
+  if(bg) bg.classList.remove('show');
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  const secs = document.getElementById('secs');
+  const bg = document.getElementById('sec-modal-bg');
+  const closeBtn = document.getElementById('sec-modal-close');
+
+  if(secs){
+    secs.addEventListener('click', (e) => {
+      const pill = e.target.closest('.sec-pill[data-sector]');
+      if(!pill) return;
+      const sector = decodeURIComponent(pill.dataset.sector || '');
+      if(sector) openSectorModal(sector);
+    });
+  }
+
+  if(closeBtn) closeBtn.addEventListener('click', closeSectorModal);
+
+  if(bg){
+    bg.addEventListener('click', (e) => {
+      if(e.target && e.target.id === 'sec-modal-bg') closeSectorModal();
+    });
+  }
+
+  document.addEventListener('keydown', (e) => {
+    if(e.key === 'Escape') closeSectorModal();
+  });
+});
+
 async function tick(){
   try{
     const [hR, aR, sR] = await Promise.all([
@@ -969,10 +1107,13 @@ async function tick(){
     const h = await hR.json();
     const all = await aR.json();
     const sec = await sR.json();
+    allData = all;
 
     // STATUS TAG
     const st = document.getElementById('status-tag');
-    if(!h.seed_done && h.seed_started){
+    if(h.init_error){
+      st.textContent = 'ERROR'; st.className = 'tag off';
+    }else if(!h.seed_done && h.seed_started){
       st.textContent = 'SEEDING'; st.className = 'tag seed';
     }else if(h.ws_connected && h.total_ticks > 0){
       st.textContent = 'LIVE'; st.className = 'tag live';
@@ -1047,7 +1188,7 @@ async function tick(){
         const p = d.avg_dirr >= 0;
         const bp = Math.min(100, (Math.abs(d.avg_dirr)/mx)*100);
         const bc = p ? 'var(--green)' : 'var(--red)';
-        sh += '<div class="sec-pill">'+
+        sh += '<div class="sec-pill sec-click" data-sector="'+encodeURIComponent(name)+'">'+
           '<span class="sn">'+escapeHtml(name)+'</span>'+
           '<span class="sd '+(p?'p':'n')+'">'+(p?'+':'')+f(d.avg_dirr,3)+'</span>'+
           '<div class="sb"><div class="sf" style="width:'+bp+'%;background:'+bc+'"></div></div>'+
@@ -1060,6 +1201,12 @@ async function tick(){
     }
 
     // TABLES
+    if(h.init_error){
+      document.getElementById('gtb').innerHTML = waitRow('Init error', escapeHtml(h.init_error));
+      document.getElementById('ltb').innerHTML = waitRow('Init error', escapeHtml(h.init_error));
+      return;
+    }
+
     if(!h.seed_done){
       const sub = 'Seeding '+h.seed_progress.done+'/'+h.seed_progress.total + (h.seed_current ? (' — '+h.seed_current) : '');
       document.getElementById('gtb').innerHTML = waitRow('Waiting for baseline seed to complete…', sub);
@@ -1105,15 +1252,18 @@ def dashboard():
 
 
 # =============================================================================
-# MAIN
+# MAIN (local)
 # =============================================================================
 if __name__ == "__main__":
     import uvicorn
 
+    if not API_KEY or not ACCESS_TOKEN:
+        log.error("Set KITE_API_KEY and KITE_ACCESS_TOKEN before running.")
+        sys.exit(1)
+
     print(f"\n  ╔══════════════════════════════════════════╗")
     print(f"  ║  RFACTOR v2 — LIVE DASHBOARD             ║")
     print(f"  ║  http://localhost:{PORT:<24} ║")
-    print(f"  ║  Symbols: {len(ACTIVE_SYMBOLS):<30} ║")
     print(f"  ╚══════════════════════════════════════════╝\n")
 
     uvicorn.run(
