@@ -1011,7 +1011,7 @@ function row(r, i){
     '</td>'+
     '<td class="num">₹'+f(r.ltp)+'</td>'+
     '<td class="num">'+pp(r.pct_open)+'</td>'+
-    '<td class="num rf">'+f(r.rfactor, 4)+'</td>'+
+    '<td class="num rf">'+f(r.rfactor, 2)+'</td>'+
     '<td class="num">'+f(r.rvolm, 2)+'x</td>'+
     '<td class="num">'+sb(r.signal)+'</td>'+
   '</tr>';
@@ -1054,7 +1054,7 @@ function openSectorModal(sector){
     const url = tvUrl(r.symbol);
     h += '<tr>'
       + '<td><a class="symlink" href="'+url+'" target="_blank" rel="noopener noreferrer">'+escapeHtml(r.symbol)+'</a></td>'
-      + '<td class="rf">' + f(r.rfactor, 4) + '</td>'
+      + '<td class="rf">' + f(r.rfactor, 2) + '</td>'
       + '<td>' + f(r.rvolm, 2) + 'X</td>'
       + '<td class="sig">' + sb(r.signal) + '</td>'
       + '</tr>';
