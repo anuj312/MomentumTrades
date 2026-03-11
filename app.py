@@ -46,10 +46,10 @@ log = logging.getLogger("rfv2")
 # CONFIG
 # =============================================================================
 IST = ZoneInfo("Asia/Kolkata")
-PORT = int(os.getenv("RFV2_PORT", "5555"))
+PORT = int(os.getenv("PORT", os.getenv("RFV2_PORT", "5555")))
 
-API_KEY = os.getenv("KITE_API_KEY", "ikfiyrgi5w2dttxb").strip()
-ACCESS_TOKEN = os.getenv("KITE_ACCESS_TOKEN", "k1h3wlDkWqTke5ZgR6w8kvfgm705bqa4").strip()
+API_KEY = os.getenv("KITE_API_KEY", "").strip()
+ACCESS_TOKEN = os.getenv("KITE_ACCESS_TOKEN", "").strip()
 if not API_KEY or not ACCESS_TOKEN:
     log.error("Set environment variables: KITE_API_KEY and KITE_ACCESS_TOKEN")
     sys.exit(1)
